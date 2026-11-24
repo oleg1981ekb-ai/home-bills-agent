@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org",
+  "type": "object",
+  "required": ["project_name", "components"],
+  "properties": {
+    "project_name": {
+      "type": "string",
+      "description": "Project name"
+    },
+    "description": {
+      "type": "string",
+      "description": "Project description"
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type"],
+        "properties": {
+          "name": {"type": "string"},
+          "type": {
+            "type": "string",
+            "enum": ["api", "frontend", "database", "service", "library"]
+          },
+          "version": {"type": "string"},
+          "authors": {"type": "array", "items": {"type": "string"}},
+          "requirements": {
+            "type": "object",
+            "properties": {
+              "python": {"type": "string"},
+              "rust": {"type": "string"},
+              "javascript": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
