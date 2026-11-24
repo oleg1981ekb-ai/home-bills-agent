@@ -10,6 +10,27 @@
 - **Decision:** Использовать прямые HTTP-запросы (httpx) с поддержкой сессии через HttpOnly cookie и разбором HTML по устойчивым признакам (подписи, структура таблицы), а не по позициям. Playwright — только запасной вариант.
 - **Consequences:** Сокращение сложности и ресурсов контейнера; при смене разметки нужно обновлять парсеры; требуется аккуратная работа с `__RequestVerificationToken`.
 
+### Стратегия Pattern + UX меню для переключения бэкенда
+
+**Strategy Pattern**: абстрактный интерфейс `VodokanalClient` с реализациями `HttpxClient` и `PlaywrightClient`; фабрика `create_client(config)` выбирает бэкенд на основе env var `VODOKANAL_BACKEND` (по умолчанию: `httpx`).
+
+**Реализация**:
+- `VodokanalClient` — протокол: `login()`, `get_counter_readings()`, `add_counter_value(value)`, `get_debt()`
+- `HttpxClient` — прямые HTTP-запросы через httpx с сохранением сессии в cookie
+- `PlaywrightClient` — управление браузером Playwright для рендеринга JavaScript-сайта
+- `create_client(config)` считывает `VODOKANAL_BACKEND` (по умолчанию `httpx`) и возвращает соответствующий экземпляр
+
+**UX меню**: оба интерфейса (CLI через questionary и Telegram inline keyboard) позволяют операторам переключать бэкенды без изменений кода.
+
+**UX principles**:
+- Пользовательские ярлыки (не технические имена): "Прямой HTTP (быстрый)" и "Браузерный Playwright (запасной вариант)"
+- Показывать текущий выбор с ✅
+- Значение по умолчанию — httpx
+- Подтверждение перед переключением
+- Автооткат к httpx если Playwright не удаётся инициализироваться
+
+---
+
 ## ADR-002: SQLite (`billing_cycles`) как источник истины вместо aiogram FSM
 
 - **Status:** Accepted
