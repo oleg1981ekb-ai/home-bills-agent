@@ -3,13 +3,14 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "{{ project_slug }}"
+name = "home-bills-agent"
 version = "0.5.0"
-description = "{{ project_description }}"
+description = "Home bills agent for Anapa water utilities"
 requires-python = ">=3.11"
 dependencies = [
     "questionary>=2.0",
     "rich>=13.0",
+    "sqlalchemy>=2.0",
 ]
 
 [tool.ruff]
