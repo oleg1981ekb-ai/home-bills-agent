@@ -45,7 +45,9 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     CycleStatus.AWAITING_PAYMENT: {
         CycleStatus.PAID,
     },
-    CycleStatus.PAID: set(),
+    CycleStatus.PAID: {
+        CycleStatus.CANCELLED,
+    },
     CycleStatus.CANCELLED: set(),
     CycleStatus.MANUAL_REVIEW: set(),
 }
