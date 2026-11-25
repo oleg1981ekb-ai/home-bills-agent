@@ -37,19 +37,22 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     CycleStatus.READING_SENT: {
         CycleStatus.AWAITING_PAYMENT,
         CycleStatus.ACCRUAL_PENDING,
+        CycleStatus.CANCELLED,
     },
     CycleStatus.ACCRUAL_PENDING: {
         CycleStatus.AWAITING_PAYMENT,
         CycleStatus.MANUAL_REVIEW,
+        CycleStatus.CANCELLED,
     },
     CycleStatus.AWAITING_PAYMENT: {
         CycleStatus.PAID,
+        CycleStatus.CANCELLED,
     },
     CycleStatus.PAID: {
         CycleStatus.CANCELLED,
     },
-    CycleStatus.CANCELLED: set(),
-    CycleStatus.MANUAL_REVIEW: set(),
+    CycleStatus.CANCELLED: {CycleStatus.WAITING_READING},
+    CycleStatus.MANUAL_REVIEW: {CycleStatus.CANCELLED},
 }
 
 

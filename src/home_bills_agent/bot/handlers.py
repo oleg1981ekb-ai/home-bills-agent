@@ -6,7 +6,7 @@ Uses FSM + SQLite as source of truth.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -128,10 +128,19 @@ def _check_once_per_day(fsm: CycleFSM) -> bool:
 
 
 async def _reply_with_menu(message: Message) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Узнать начисление / Оплатить", callback_data="pay_menu")],
+            [InlineKeyboardButton(text="🔄 Сбросить цикл", callback_data="reset_cycle")],
+        ]
+    )
     await message.answer(
         "👋 Привет! Я бот Анапа Водоканал.\n\n"
         "Отправь целое показание счётчика, например: 100\n\n"
-        "Команды: /start, /status, /help"
+        "Команды: /start, /status, /help, /pay",
+        reply_markup=kb,
     )
 
 
@@ -146,9 +155,155 @@ async def cmd_help(message: Message) -> None:
         "📋 Доступные команды:\n"
         "/start — главное меню\n"
         "/status — текущий цикл\n"
-        "/help — помощь\n\n"
+        "/pay — узнать начисление и перейти к оплате\n"
+        "/help — помощь\n"
+        "/reset — сбросить текущий цикл и начать заново\n\n"
         "Просто отправь целое число — это показание счётчика."
     )
+
+
+@router.message(F.text == "/reset")
+async def cmd_reset(message: Message) -> None:
+    """Reset current billing cycle to start fresh."""
+    fsm = _get_fsm()
+    period = _current_period()
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.WAITING_READING,
+            event_type="cycle.reset",
+            event_description="Цикл сброшен командой /reset.",
+        )
+        await message.answer("🔄 Цикл сброшен. Отправьте показание счётчика.")
+        return
+
+    # Cancel current cycle if it's not already terminal
+    if active.status != CycleStatus.CANCELLED:
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.CANCELLED,
+            event_type="cycle.reset",
+            event_description=f"Цикл сброшен из статуса {active.status}.",
+        )
+
+    c = fsm.transition(
+        settings.ACCOUNT_ID,
+        period,
+        CycleStatus.WAITING_READING,
+        event_type="cycle.reset",
+        event_description="Новый цикл после сброса.",
+    )
+    if c:
+        await message.answer("🔄 Цикл сброшен. Отправьте показание счётчика.")
+    else:
+        await message.answer("❌ Не удалось сбросить цикл.")
+
+
+@router.message(F.text == "/pay")
+async def cmd_pay(message: Message) -> None:
+    """Запросить начисление и перевести в статус ожидания оплаты (AWAITING_PAYMENT).
+    
+    Пользователь говорит: показание уже подано, пора оплачивать.
+    Бот узнаёт долг через клиент Водоканала и показывает ссылку на оплату А3.
+    """
+    fsm = _get_fsm()
+    period = _current_period()
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        await message.answer(
+            "ℹ️ Цикл не начат. Сначала отправьте показание счётчика.\n\n"
+            "Просто отправьте целое число — это показание."
+        )
+        return
+
+    # Можно переходить в AWAITING_PAYMENT только из READING_SENT или ACCRUAL_PENDING
+    if active.status not in (
+        CycleStatus.READING_SENT,
+        CycleStatus.ACCRUAL_PENDING,
+        CycleStatus.AWAITING_PAYMENT,
+    ):
+        status_emoji = {
+            CycleStatus.WAITING_READING: "⏳",
+            CycleStatus.AWAITING_ANOMALY_CONFIRMATION: "⚠️",
+            CycleStatus.PAID: "✅",
+            CycleStatus.MANUAL_REVIEW: "🔧",
+            CycleStatus.CANCELLED: "❌",
+        }.get(active.status, "❓")
+        await message.answer(
+            f"{status_emoji} Статус: {active.status}\n\n"
+            "Оплата доступна только после передачи показания.\n"
+            "Отправьте целое число — это показание счётчика."
+        )
+        return
+
+    # Запрашиваем долг у провайдера
+    client = get_vodokanal_client(
+        dry_run=settings.DRY_RUN,
+        login=settings.VODOKAN_LOGIN,
+        password=settings.VODOKAN_PASSWORD,
+    )
+    try:
+        await client.login()
+        debt_str, _accrual = await client.get_debt()
+    except Exception as exc:
+        logger.exception("Failed to query debt from vodokanal client")
+        await message.answer(
+            f"❌ Не удалось узнать начисление. Попробуйте позже.\n({exc})"
+        )
+        return
+
+    if debt_str is None:
+        await message.answer(
+            "ℹ️ Начисления пока не найдено. "
+            "Попробуйте снова позже или проверьте ЛК Водоканала."
+        )
+        return
+
+    try:
+        debt = Decimal(debt_str)
+    except (InvalidOperation, ValueError, TypeError):
+        logger.warning("Invalid debt value from client: %r", debt_str)
+        await message.answer("❌ Неверный формат начисления от провайдера.")
+        return
+
+    if debt <= 0:
+        await message.answer(
+            "ℹ️ Долг равен нулю — оплачивать нечего. "
+            "Спасибо за оплату!"
+        )
+        return
+
+    # Переход в AWAITING_PAYMENT (если ещё не там)
+    new_status = CycleStatus.AWAITING_PAYMENT
+    if active.status != new_status:
+        c = fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            new_status,
+            debt_after=debt,
+            payment_link=build_payment_link(settings.ACCOUNT_ID),
+            event_type="payment.requested",
+            event_description=f"Пользователь запросил оплату. Долг: {debt}.",
+        )
+    else:
+        c = fsm.update(
+            settings.ACCOUNT_ID,
+            period,
+            debt_after=debt,
+            payment_link=build_payment_link(settings.ACCOUNT_ID),
+        )
+
+    if c:
+        await message.answer(_payment_text(c), reply_markup=_payment_keyboard(
+            c.payment_link or build_payment_link(settings.ACCOUNT_ID)
+        ))
+    else:
+        await message.answer("❌ Не удалось перевести в статус оплаты.")
 
 
 @router.message(F.text == "/status")
@@ -166,8 +321,81 @@ async def cmd_status(message: Message) -> None:
         CycleStatus.PAID: "✅",
         CycleStatus.MANUAL_REVIEW: "🔧",
         CycleStatus.CANCELLED: "❌",
+        CycleStatus.ACCRUAL_PENDING: "🔍",
     }.get(cycle.status, "❓")
-    await message.answer(f"{status_emoji} Статус: {cycle.status}")
+    status_label = {
+        CycleStatus.WAITING_READING: "Ожидание показания",
+        CycleStatus.READING_SENT: "Показание передано",
+        CycleStatus.AWAITING_ANOMALY_CONFIRMATION: "Аномалия подтверждена",
+        CycleStatus.AWAITING_PAYMENT: "Ожидание оплаты",
+        CycleStatus.PAID: "Оплачено",
+        CycleStatus.MANUAL_REVIEW: "Ручной разбор",
+        CycleStatus.CANCELLED: "Отменено",
+        CycleStatus.ACCRUAL_PENDING: "Ожидание начисления",
+    }.get(cycle.status, cycle.status)
+    text = f"{status_emoji} Статус: {status_label} ({cycle.status})"
+    hint = _reset_hint(cycle)
+    if hint:
+        text += f"\n\n{hint}"
+    await message.answer(text)
+
+
+# Порог «зависшего» цикла: 24 часа без изменений
+STALE_HOURS = 24
+
+
+def _reset_hint(cycle) -> str | None:
+    """Диагностика: вернуть подсказку о необходимости /reset, если цикл застрял."""
+    # Терминальные статусы, из которых нельзя продолжить без сброса
+    if cycle.status == CycleStatus.CANCELLED:
+        return "⚠️ Цикл отменён — новые показания не принимаются.\nОтправьте /reset для начала заново."
+    if cycle.status == CycleStatus.MANUAL_REVIEW:
+        return "⚠️ Цикл требует ручного разбора.\nОтправьте /reset для начала заново."
+
+    now = datetime.now(UTC)
+
+    def _to_aware(dt: datetime | None) -> datetime | None:
+        """Привести naive datetime из БД (utcnow) к aware UTC для сравнения."""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt
+
+    # Просроченная повторная проверка начисления
+    next_check = _to_aware(cycle.next_check_at)
+    if cycle.status == CycleStatus.ACCRUAL_PENDING and next_check is not None and now > next_check:
+        overdue = now - next_check
+        hours = int(overdue.total_seconds() // 3600)
+        return (
+            f"⚠️ Проверка начисления просрочена на {hours} ч.\n"
+            "Если начисление так и не появилось — отправьте /reset."
+        )
+
+    # Зависание в промежуточном статусе дольше STALE_HOURS
+    updated = _to_aware(cycle.updated_at or cycle.created_at)
+    if (
+        updated is not None
+        and cycle.status
+        not in (
+            CycleStatus.WAITING_READING,
+            CycleStatus.PAID,
+        )
+        and (now - updated).total_seconds() > STALE_HOURS * 3600
+    ):
+        hours = int((now - updated).total_seconds() // 3600)
+        return (
+            f"⚠️ Цикл без изменений уже {hours} ч в статусе {cycle.status}.\n"
+            "Если это зависание — отправьте /reset."
+        )
+
+    # Много неудачных повторов
+    if (cycle.retry_count or 0) >= 3:
+        return (
+            f"⚠️ Неудачных повторов: {cycle.retry_count}.\n"
+            "Рекомендуется /reset или ручная проверка."
+        )
+    return None
 
 
 def _check_anomaly(
@@ -178,8 +406,8 @@ def _check_anomaly(
     if med is not None and med > 0:
         # Simple heuristic: if value >> median * factor, flag as anomaly
         # In full implementation, compare daily consumption
-        delta = value - prev_reading
-        if delta > med * settings.ANOMALY_FACTOR:
+        delta = Decimal(value) - Decimal(prev_reading or 0)
+        if delta > med * Decimal(str(settings.ANOMALY_FACTOR)):
             return True
     elif med is None:
         # Not enough data — always confirm
@@ -212,6 +440,14 @@ def _cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отменить оплату", callback_data="cancel_payment")]
+        ]
+    )
+
+
+def _reset_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Сбросить цикл", callback_data="reset_cycle")]
         ]
     )
 
@@ -266,7 +502,8 @@ async def _handle_reading(message: Message, value: int) -> None:
         await message.answer(f"❌ Показание меньше предыдущего ({last_reading}).")
         return
 
-    if fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period()) is None:
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period())
+    if active is None or active.status == CycleStatus.CANCELLED:
         fsm.transition(
             settings.ACCOUNT_ID,
             _current_period(),
@@ -303,7 +540,11 @@ async def _handle_reading(message: Message, value: int) -> None:
                         InlineKeyboardButton(
                             text="✅ Подтвердить",
                             callback_data=f"confirm:{value}",
-                        )
+                        ),
+                        InlineKeyboardButton(
+                            text="🔄 Сбросить цикл",
+                            callback_data="reset_cycle",
+                        ),
                     ]
                 ]
             )
@@ -487,7 +728,11 @@ async def _handle_photo(message: Message) -> None:
                 InlineKeyboardButton(
                     text="✅ Подтвердить",
                     callback_data=f"confirm:{value}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Сбросить цикл",
+                    callback_data="reset_cycle",
+                ),
             ]
         ]
     )
@@ -589,6 +834,135 @@ async def cb_cancel_payment(callback: CallbackQuery) -> None:
         )
     else:
         await callback.answer("❌ Не удалось отменить.")
+
+
+@router.callback_query(F.data == "pay_menu")
+async def cb_pay_menu(callback: CallbackQuery) -> None:
+    """User pressed the 'Pay' menu button: request accrual and show payment link."""
+    fsm = _get_fsm()
+    period = _current_period()
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        await callback.answer("ℹ️ Цикл не начат. Сначала отправьте показание счётчика.")
+        return
+
+    if active.status not in (
+        CycleStatus.READING_SENT,
+        CycleStatus.ACCRUAL_PENDING,
+        CycleStatus.AWAITING_PAYMENT,
+    ):
+        status_emoji = {
+            CycleStatus.WAITING_READING: "⏳",
+            CycleStatus.AWAITING_ANOMALY_CONFIRMATION: "⚠️",
+            CycleStatus.PAID: "✅",
+            CycleStatus.MANUAL_REVIEW: "🔧",
+            CycleStatus.CANCELLED: "❌",
+        }.get(active.status, "❓")
+        await callback.answer(
+            f"{status_emoji} Статус: {active.status}\n\n"
+            "Оплата доступна только после передачи показания.\n"
+            "Отправьте целое число — это показание счётчика."
+        )
+        return
+
+    client = get_vodokanal_client(
+        dry_run=settings.DRY_RUN,
+        login=settings.VODOKAN_LOGIN,
+        password=settings.VODOKAN_PASSWORD,
+    )
+    try:
+        await client.login()
+        debt_str, _accrual = await client.get_debt()
+    except Exception as exc:
+        logger.exception("Failed to query debt from vodokanal client")
+        await callback.answer(f"❌ Не удалось узнать начисление. Попробуйте позже.\n({exc})")
+        return
+
+    if debt_str is None:
+        await callback.answer(
+            "ℹ️ Начисления пока не найдено. Попробуйте снова позже или проверьте ЛК Водоканала."
+        )
+        return
+
+    try:
+        debt = Decimal(debt_str)
+    except (InvalidOperation, ValueError, TypeError):
+        await callback.answer("❌ Неверный формат начисления от провайдера.")
+        return
+
+    if debt <= 0:
+        await callback.answer("ℹ️ Долг равен нулю — оплачивать нечего. Спасибо за оплату!")
+        return
+
+    if active.status != CycleStatus.AWAITING_PAYMENT:
+        c = fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.AWAITING_PAYMENT,
+            debt_after=debt,
+            payment_link=build_payment_link(settings.ACCOUNT_ID),
+            event_type="payment.requested",
+            event_description=f"Пользователь запросил оплату. Долг: {debt}.",
+        )
+    else:
+        c = fsm.update(
+            settings.ACCOUNT_ID,
+            period,
+            debt_after=debt,
+            payment_link=build_payment_link(settings.ACCOUNT_ID),
+        )
+
+    if c:
+        await callback.message.edit_text(
+            _payment_text(c),
+            reply_markup=_payment_keyboard(c.payment_link or build_payment_link(settings.ACCOUNT_ID)),
+        )
+        await callback.answer("💳 Оплатить?", show_alert=False)
+    else:
+        await callback.answer("❌ Не удалось перевести в статус оплаты.")
+
+
+@router.callback_query(F.data == "reset_cycle")
+async def cb_reset_cycle(callback: CallbackQuery) -> None:
+    fsm = _get_fsm()
+    period = _current_period()
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.WAITING_READING,
+            event_type="cycle.reset",
+            event_description="Цикл сброшен кнопкой.",
+        )
+        await callback.message.edit_text("🔄 Цикл сброшен. Отправьте показание счётчика.")
+        return
+
+    if active.status not in (
+        CycleStatus.CANCELLED,
+        CycleStatus.MANUAL_REVIEW,
+    ):
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.CANCELLED,
+            event_type="cycle.reset",
+            event_description=f"Цикл сброшен из статуса {active.status}.",
+        )
+
+    c = fsm.transition(
+        settings.ACCOUNT_ID,
+        period,
+        CycleStatus.WAITING_READING,
+        event_type="cycle.reset",
+        event_description="Новый цикл после сброса.",
+    )
+    if c:
+        await callback.message.edit_text("🔄 Цикл сброшен. Отправьте показание счётчика.")
+    else:
+        await callback.answer("❌ Не удалось сбросить цикл.")
 
 
 @router.message(F.photo)

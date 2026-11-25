@@ -83,7 +83,9 @@ class StubVodokanalClient(VodokanalClient):
 
     async def get_debt(self) -> tuple[str | None, str | None]:
         if self.dry_run:
-            return self.last_debt, None
+            # Mock debt for DRY_RUN payment flow testing.
+            # In real mode this queries the Vodokanal LK.
+            return "1500.00", "1500.00"
         return None, None
 
 
