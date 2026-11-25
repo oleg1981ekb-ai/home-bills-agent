@@ -35,11 +35,14 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
+    # Register bot for reminder dispatching.
+    jobs.init(bot)
+
     scheduler = AsyncIOScheduler(timezone=settings.TZ)
 
     # Напоминания: утро 09:00, вечер 19:00 (с 22-го).
     scheduler.add_job(
-        jobs.check_due_reminders,
+        jobs.dispatch_due_reminders,
         "cron",
         hour=settings.REMINDER_TIME.split(":")[0],
         minute=settings.REMINDER_TIME.split(":")[1],
@@ -47,7 +50,7 @@ async def main() -> None:
         replace_existing=True,
     )
     scheduler.add_job(
-        jobs.check_due_reminders,
+        jobs.dispatch_due_reminders,
         "cron",
         hour=settings.EVENING_TIME.split(":")[0],
         minute=settings.EVENING_TIME.split(":")[1],
@@ -57,7 +60,7 @@ async def main() -> None:
 
     # Повторные проверки начислений: каждые 6 часов.
     scheduler.add_job(
-        jobs.check_due_reminders,
+        jobs.dispatch_due_reminders,
         "interval",
         hours=6,
         id="accrual_recheck",
