@@ -1,8 +1,8 @@
 {
   "$schema": "https://kilo.ai",
-  "model": "{{ primary_model }}",
-  "small_model": "{{ primary_model }}",
-  "subagent_model": "{{ primary_model }}",
+  "model": "anthropic/claude-sonnet-4-5",
+  "small_model": "anthropic/claude-sonnet-4-5",
+  "subagent_model": "anthropic/claude-sonnet-4-5",
   "reasoning_display": "preview",
   "terminal_command_display": "collapsed",
   "code_edit_display": "collapsed",
