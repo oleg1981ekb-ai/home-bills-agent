@@ -100,3 +100,22 @@ class Event(Base):
     description = Column(String, nullable=True)
     masked_account = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class SentMessage(Base):
+    """Sent-message ledger for reminder de-duplication and recovery.
+
+    Keyed by (account_id, period, message_id) is too narrow; use
+    (account_id, period, sent_at) or idempotency key from event.
+    For simplicity: composite key (account_id, period) for latest sent state.
+    """
+
+    __tablename__ = "sent_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String, index=True, nullable=False)
+    period = Column(String, index=True, nullable=False)
+    telegram_message_id = Column(String, nullable=True)
+    sent_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    status = Column(String, nullable=False, default="sent")
+    details = Column(String, nullable=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, ClassVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -56,10 +57,14 @@ class CycleFSM:
     Использует транзакцию для атомарной проверки и обновления состояния.
     """
 
+    # Общий для всех экземпляров кэш dry-run: в DRY_RUN ничего не коммитится в БД,
+    # поэтому состояние цикла должно переживать создание нового CycleFSM между
+    # запросами (иначе каждый вызов _get_fsm() теряет цикл).
+    _dry_run_cache: ClassVar[dict[tuple[str, str], BillingCycle]] = {}
+
     def __init__(self, session_factory, *, dry_run: bool = False) -> None:
         self._session_factory = session_factory
         self._dry_run = dry_run
-        self._dry_run_cache: dict[tuple[str, str], BillingCycle] = {}
 
     def _get_active_cycle(
         self, session: Session, account_id: str, period: str
@@ -67,8 +72,8 @@ class CycleFSM:
         # В dry-run режиме сначала проверяем кэш
         if self._dry_run:
             key = (account_id, period)
-            if key in self._dry_run_cache:
-                return self._dry_run_cache[key]
+            if key in CycleFSM._dry_run_cache:
+                return CycleFSM._dry_run_cache[key]
         stmt = select(BillingCycle).where(
             BillingCycle.account_id == account_id,
             BillingCycle.period == period,
@@ -170,7 +175,7 @@ class CycleFSM:
                 session.refresh(cycle)
             else:
                 # В dry-run режиме сохраняем в кэш и откатываем сессию
-                self._dry_run_cache[(account_id, period)] = cycle
+                CycleFSM._dry_run_cache[(account_id, period)] = cycle
                 session.rollback()
 
             return cycle
@@ -181,6 +186,29 @@ class CycleFSM:
         """Получить активный цикл (без транзакции)."""
         with self._session_factory() as session:
             return self._get_active_cycle(session, account_id, period)
+
+    def update(
+        self, account_id: str, period: str, **fields: Any
+    ) -> BillingCycle | None:
+        """Обновить произвольные поля активного цикла без смены статуса.
+
+        Используется для проверок оплаты/сверок, где статус не меняется
+        (например, обновление payment_verified_at или next_check_at).
+        """
+        with self._session_factory() as session:
+            cycle = self._get_active_cycle(session, account_id, period)
+            if cycle is None:
+                return None
+            for key, value in fields.items():
+                if hasattr(cycle, key) and value is not None:
+                    setattr(cycle, key, value)
+            if not self._dry_run:
+                session.commit()
+                session.refresh(cycle)
+            else:
+                CycleFSM._dry_run_cache[(account_id, period)] = cycle
+                session.rollback()
+            return cycle
 
     def is_idempotent(self, account_id: str, period: str) -> bool:
         """Проверить, можно ли повторить операцию без побочных эффектов."""
