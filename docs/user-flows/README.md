@@ -41,5 +41,5 @@
 - `src/home_bills_agent/bot/handlers.py` — все хендлеры (команды, чтение показаний, фото, оплата, отмена)
 - `src/home_bills_agent/assistant/vision.py` — распознавание фото (Anthropic / OpenRouter)
 - `src/home_bills_agent/storage/fsm.py` — FSM и переходы состояний
-- `src/home_bills_agent/scheduler/jobs.py` — напоминания, сверка начислений, проверка оплаты
+- `src/home_bills_agent/scheduler/jobs.py` — напоминания, сверка начислений, проверка оплаты _
 - `src/home_bills_agent/config.py` — настройки, whitelist, DRY_RUN
