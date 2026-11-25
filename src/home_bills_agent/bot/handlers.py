@@ -17,7 +17,7 @@ from sqlalchemy import select
 from home_bills_agent.assistant.vision import VisionResult, is_confident, recognize_reading
 from home_bills_agent.config import settings
 from home_bills_agent.payment.links import build_payment_link
-from home_bills_agent.providers.anapa_vodokanal.client import StubVodokanalClient
+from home_bills_agent.providers.anapa_vodokanal.client import get_vodokanal_client
 from home_bills_agent.storage import CycleFSM, CycleStatus, init_db
 from home_bills_agent.storage.anomaly import can_detect_anomaly, median_of_whole_readings
 from home_bills_agent.storage.models import ReadingsCache
@@ -38,7 +38,12 @@ def _current_period() -> str:
 
 async def _get_last_reading() -> int:
     """Get last whole reading from LK client (dry-run/stub aware) or fallback."""
-    client = StubVodokanalClient(dry_run=settings.DRY_RUN)
+    client = get_vodokanal_client(
+        dry_run=settings.DRY_RUN,
+        login=settings.VODOKAN_LOGIN,
+        password=settings.VODOKAN_PASSWORD,
+    )
+    await client.login()
     whole, _prev, _debt = await client.get_counter_readings()
     if whole is not None:
         return int(whole)
@@ -311,7 +316,12 @@ async def _handle_reading(message: Message, value: int) -> None:
             return
 
     # Normal flow: send reading via DRY_RUN stub
-    client = StubVodokanalClient(dry_run=settings.DRY_RUN)
+    client = get_vodokanal_client(
+        dry_run=settings.DRY_RUN,
+        login=settings.VODOKAN_LOGIN,
+        password=settings.VODOKAN_PASSWORD,
+    )
+    await client.login()
     success, err_msg = await client.add_counter_value(value)
 
     if not success:
