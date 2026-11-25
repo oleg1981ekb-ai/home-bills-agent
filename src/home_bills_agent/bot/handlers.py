@@ -18,6 +18,7 @@ from home_bills_agent.assistant.vision import VisionResult, is_confident, recogn
 from home_bills_agent.config import settings
 from home_bills_agent.payment.links import build_payment_link
 from home_bills_agent.providers.anapa_vodokanal.client import get_vodokanal_client
+from home_bills_agent.scheduler.jobs import reconcile_after_send
 from home_bills_agent.storage import CycleFSM, CycleStatus, init_db
 from home_bills_agent.storage.anomaly import can_detect_anomaly, median_of_whole_readings
 from home_bills_agent.storage.models import ReadingsCache
@@ -350,19 +351,39 @@ async def _handle_reading(message: Message, value: int) -> None:
         event_type="reading.sent",
         event_description=f"Показание {value} передано.",
     )
-    if c:
-        consumption = c.consumption
-        consumption_str = f"{int(consumption)} м³" if consumption is not None else "—"
-        await message.answer(
-            f"✅ Показание {value} передано. Расход: {consumption_str}."
-        )
-        awaiting = _advance_to_awaiting_payment(fsm)
-        if awaiting:
-            await _send_payment_prompt(message, awaiting)
-        else:
-            await message.answer("✅ Показание передано. Ожидаем начисления.")
-    else:
+    if not c:
         await message.answer("❌ Не удалось обновить статус.")
+        return
+
+    consumption = c.consumption
+    consumption_str = f"{int(consumption)} м³" if consumption is not None else "—"
+    await message.answer(
+        f"✅ Показание {value} передано. Расход: {consumption_str}."
+    )
+
+    # Reconciliation after send: READING_SENT -> AWAITING_PAYMENT (debt seen)
+    # or ACCRUAL_PENDING (await accrual, will re-check later).
+    _whole, _prev_lk, _debt_str = await client.get_counter_readings()
+    _debt_after_str, _accrual_today = await client.get_debt()
+    debt_after: Decimal | None = None
+    if _debt_after_str is not None:
+        try:
+            debt_after = Decimal(_debt_after_str)
+        except (InvalidOperation, ValueError, TypeError):
+            debt_after = None
+    final_status = reconcile_after_send(
+        fsm,
+        settings.ACCOUNT_ID,
+        _current_period(),
+        reading_visible=_whole is not None,
+        debt_after=debt_after,
+        now=datetime.now(),
+    )
+    cycle_after = fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period())
+    if final_status == CycleStatus.AWAITING_PAYMENT and cycle_after is not None:
+        await _send_payment_prompt(message, cycle_after)
+    elif final_status == CycleStatus.ACCRUAL_PENDING:
+        await message.answer("✅ Показание передано. Ожидаем начисления, проверим позже.")
 
 
 async def _handle_photo(message: Message) -> None:
