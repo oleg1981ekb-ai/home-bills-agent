@@ -43,6 +43,8 @@ async def _get_last_reading() -> int:
         dry_run=settings.DRY_RUN,
         login=settings.VODOKAN_LOGIN,
         password=settings.VODOKAN_PASSWORD,
+        account_id=settings.ACCOUNT_ID,
+        counter_code=settings.COUNTER_CODE,
     )
     await client.login()
     whole, _prev, _debt = await client.get_counter_readings()
@@ -209,43 +211,16 @@ async def cmd_pay(message: Message) -> None:
     
     Пользователь говорит: показание уже подано, пора оплачивать.
     Бот узнаёт долг через клиент Водоканала и показывает ссылку на оплату А3.
+    Работает даже без существующего цикла — показывает текущий долг.
     """
     fsm = _get_fsm()
     period = _current_period()
-    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
-
-    if active is None:
-        await message.answer(
-            "ℹ️ Цикл не начат. Сначала отправьте показание счётчика.\n\n"
-            "Просто отправьте целое число — это показание."
-        )
-        return
-
-    # Можно переходить в AWAITING_PAYMENT только из READING_SENT или ACCRUAL_PENDING
-    if active.status not in (
-        CycleStatus.READING_SENT,
-        CycleStatus.ACCRUAL_PENDING,
-        CycleStatus.AWAITING_PAYMENT,
-    ):
-        status_emoji = {
-            CycleStatus.WAITING_READING: "⏳",
-            CycleStatus.AWAITING_ANOMALY_CONFIRMATION: "⚠️",
-            CycleStatus.PAID: "✅",
-            CycleStatus.MANUAL_REVIEW: "🔧",
-            CycleStatus.CANCELLED: "❌",
-        }.get(active.status, "❓")
-        await message.answer(
-            f"{status_emoji} Статус: {active.status}\n\n"
-            "Оплата доступна только после передачи показания.\n"
-            "Отправьте целое число — это показание счётчика."
-        )
-        return
-
-    # Запрашиваем долг у провайдера
     client = get_vodokanal_client(
         dry_run=settings.DRY_RUN,
         login=settings.VODOKAN_LOGIN,
         password=settings.VODOKAN_PASSWORD,
+        account_id=settings.ACCOUNT_ID,
+        counter_code=settings.COUNTER_CODE,
     )
     try:
         await client.login()
@@ -278,15 +253,27 @@ async def cmd_pay(message: Message) -> None:
         )
         return
 
-    # Переход в AWAITING_PAYMENT (если ещё не там)
-    new_status = CycleStatus.AWAITING_PAYMENT
-    if active.status != new_status:
+    payment_link = build_payment_link(settings.ACCOUNT_ID)
+
+    # Есть ли активный цикл
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        # Нет цикла — просто показываем долг и ссылку, без перехода в FSM
+        await message.answer(
+            _payment_text_with_debt(debt, payment_link),
+            reply_markup=_payment_keyboard(payment_link),
+        )
+        return
+
+    # Иначе — переход в AWAITING_PAYMENT
+    if active.status != CycleStatus.AWAITING_PAYMENT:
         c = fsm.transition(
             settings.ACCOUNT_ID,
             period,
-            new_status,
+            CycleStatus.AWAITING_PAYMENT,
             debt_after=debt,
-            payment_link=build_payment_link(settings.ACCOUNT_ID),
+            payment_link=payment_link,
             event_type="payment.requested",
             event_description=f"Пользователь запросил оплату. Долг: {debt}.",
         )
@@ -295,13 +282,11 @@ async def cmd_pay(message: Message) -> None:
             settings.ACCOUNT_ID,
             period,
             debt_after=debt,
-            payment_link=build_payment_link(settings.ACCOUNT_ID),
+            payment_link=payment_link,
         )
 
     if c:
-        await message.answer(_payment_text(c), reply_markup=_payment_keyboard(
-            c.payment_link or build_payment_link(settings.ACCOUNT_ID)
-        ))
+        await message.answer(_payment_text(c), reply_markup=_payment_keyboard(c.payment_link or payment_link))
     else:
         await message.answer("❌ Не удалось перевести в статус оплаты.")
 
@@ -452,14 +437,18 @@ def _reset_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _payment_text_with_debt(debt: Decimal | None, payment_link: str) -> str:
+    lines = ["💳 Оплата"]
+    if debt is not None:
+        lines.append(f"Долг: {debt} руб.")
+    lines.append("Ссылка на оплату:")
+    lines.append(payment_link)
+    return "\n".join(lines)
+
+
 def _payment_text(cycle) -> str:
     link = cycle.payment_link or build_payment_link(settings.ACCOUNT_ID)
-    lines = ["💳 Оплата"]
-    if cycle.debt_after is not None:
-        lines.append(f"Долг: {cycle.debt_after} руб.")
-    lines.append("Ссылка на оплату:")
-    lines.append(link)
-    return "\n".join(lines)
+    return _payment_text_with_debt(cycle.debt_after, link)
 
 
 async def _send_payment_prompt(message: Message, cycle) -> None:
@@ -562,6 +551,8 @@ async def _handle_reading(message: Message, value: int) -> None:
         dry_run=settings.DRY_RUN,
         login=settings.VODOKAN_LOGIN,
         password=settings.VODOKAN_PASSWORD,
+        account_id=settings.ACCOUNT_ID,
+        counter_code=settings.COUNTER_CODE,
     )
     await client.login()
     success, err_msg = await client.add_counter_value(value)
@@ -843,33 +834,12 @@ async def cb_pay_menu(callback: CallbackQuery) -> None:
     period = _current_period()
     active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
 
-    if active is None:
-        await callback.answer("ℹ️ Цикл не начат. Сначала отправьте показание счётчика.")
-        return
-
-    if active.status not in (
-        CycleStatus.READING_SENT,
-        CycleStatus.ACCRUAL_PENDING,
-        CycleStatus.AWAITING_PAYMENT,
-    ):
-        status_emoji = {
-            CycleStatus.WAITING_READING: "⏳",
-            CycleStatus.AWAITING_ANOMALY_CONFIRMATION: "⚠️",
-            CycleStatus.PAID: "✅",
-            CycleStatus.MANUAL_REVIEW: "🔧",
-            CycleStatus.CANCELLED: "❌",
-        }.get(active.status, "❓")
-        await callback.answer(
-            f"{status_emoji} Статус: {active.status}\n\n"
-            "Оплата доступна только после передачи показания.\n"
-            "Отправьте целое число — это показание счётчика."
-        )
-        return
-
     client = get_vodokanal_client(
         dry_run=settings.DRY_RUN,
         login=settings.VODOKAN_LOGIN,
         password=settings.VODOKAN_PASSWORD,
+        account_id=settings.ACCOUNT_ID,
+        counter_code=settings.COUNTER_CODE,
     )
     try:
         await client.login()
@@ -895,13 +865,25 @@ async def cb_pay_menu(callback: CallbackQuery) -> None:
         await callback.answer("ℹ️ Долг равен нулю — оплачивать нечего. Спасибо за оплату!")
         return
 
+    payment_link = build_payment_link(settings.ACCOUNT_ID)
+
+    # Если цикла нет — просто показываем долг и ссылку, без перехода в FSM
+    if active is None:
+        await callback.message.edit_text(
+            _payment_text_with_debt(debt, payment_link),
+            reply_markup=_payment_keyboard(payment_link),
+        )
+        await callback.answer("💳 Оплатить?", show_alert=False)
+        return
+
+    # Иначе — переход в AWAITING_PAYMENT
     if active.status != CycleStatus.AWAITING_PAYMENT:
         c = fsm.transition(
             settings.ACCOUNT_ID,
             period,
             CycleStatus.AWAITING_PAYMENT,
             debt_after=debt,
-            payment_link=build_payment_link(settings.ACCOUNT_ID),
+            payment_link=payment_link,
             event_type="payment.requested",
             event_description=f"Пользователь запросил оплату. Долг: {debt}.",
         )
@@ -910,7 +892,7 @@ async def cb_pay_menu(callback: CallbackQuery) -> None:
             settings.ACCOUNT_ID,
             period,
             debt_after=debt,
-            payment_link=build_payment_link(settings.ACCOUNT_ID),
+            payment_link=payment_link,
         )
 
     if c:
