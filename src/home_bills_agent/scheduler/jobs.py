@@ -10,6 +10,13 @@ from home_bills_agent.storage.anomaly import compute_debt_delta
 
 SESSION_FACTORY = init_db()
 FSM = CycleFSM(SESSION_FACTORY, dry_run=settings.DRY_RUN)
+_BOT: object | None = None
+
+
+def init(bot: object) -> None:
+    """Register bot instance for reminder dispatching."""
+    global _BOT
+    _BOT = bot
 
 
 def _period_now() -> str:
@@ -19,6 +26,30 @@ def _period_now() -> str:
 def _sent_message_key(account_id: str, period: str) -> tuple[str, str]:
     """Key for sent-message dedup."""
     return (account_id, period)
+
+
+def _action_text(action: str) -> str | None:
+    """Return a human-readable message for a given reminder action."""
+    kind = action.split(":")[0] if ":" in action else action
+    if kind == "morning_reminder":
+        return f"🔔 Напоминание: передайте показания счётника. Приём открыт с {settings.REMINDER_START_DAY} по {settings.WINDOW_END} число."
+    if kind == "accrual_recheck":
+        return "🔁 Проверяем наличие начисления. Перейдите в ЛК или нажмите «Оплачено», если заплатили."
+    if kind == "accrual_check":
+        return "📈 Начисление прошло. Нажмите «Оплачено», если уже произошла оплата."
+    return None
+
+
+async def dispatch_due_reminders() -> list[str]:
+    """Send all pending reminders and return list of action keys processed."""
+    actions = check_due_reminders()
+    sent: list[str] = []
+    for action in actions:
+        text = _action_text(action)
+        if text and _BOT is not None:
+            await _BOT.send_message(chat_id=settings.TELEGRAM_USER_ID, text=text)
+        sent.append(action)
+    return sent
 
 
 def check_due_reminders() -> list[str]:
@@ -48,6 +79,18 @@ def check_due_reminders() -> list[str]:
         # Verify after sending; if debt not yet changed -> schedule accrual recheck
         compute_debt_delta([cycle.__dict__] if hasattr(cycle, "__dict__") else [])
         actions.append(f"accrual_check:{cycle.account_id}:{period}")
+
+    elif cycle.status == CycleStatus.PAID:
+        # Payment verification: check if debt decreased after user marked PAID.
+        check_payment(
+            FSM,
+            cycle.account_id,
+            period,
+            debt_before=cycle.debt_before,
+            debt_now=cycle.debt_after,
+            now=datetime.now(),
+        )
+        actions.append(f"payment_check:{cycle.account_id}:{period}")
 
     return actions
 

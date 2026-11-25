@@ -88,7 +88,13 @@ class StubVodokanalClient(VodokanalClient):
 
 
 class HttpxVodokanalClient(VodokanalClient):
-    """Real client using httpx with session persistence."""
+    """Real client using httpx with session persistence.
+
+    Uses the AO «Анапа Водоканал» LK endpoints:
+    - POST {base}/Account/Login  (credentials)
+    - GET  {base}/...            (readings + debt)
+    - POST {base}/AddCounterValue (value + __RequestVerificationToken)
+    """
 
     def __init__(self, cfg: ClientConfig) -> None:
         self.cfg = cfg
@@ -108,24 +114,72 @@ class HttpxVodokanalClient(VodokanalClient):
             self.session = None
 
     async def login(self) -> bool:
-        return self.session is not None
+        if not self.session:
+            return False
+        resp = await self.session.post(
+            f"{self.cfg.base_url}/Account/Login",
+            data={"login": self.cfg.login, "password": self.cfg.password},
+            headers={"Accept": "text/html"},
+        )
+        if resp.status_code >= 400:
+            return False
+        self.csrf_token = resp.cookies.get("XSRF-TOKEN") or self.csrf_token
+        return True
 
     async def get_counter_readings(
         self,
     ) -> tuple[int | None, int | None, str | None]:
         if not self.session:
             return None, None, None
-        # Read whole reading + previous + debt from LK HTML table
-        return None, None, None  # placeholder
+        resp = await self.session.get(f"{self.cfg.base_url}/Personal/Readings")
+        if resp.status_code >= 400:
+            return None, None, None
+        text = resp.text
+        # Extract all integer-like numbers from HTML table rows.
+        # Real LK markup is not known yet; parse whole + previous via regex.
+        nums: list[int] = []
+        for token in text.replace("\u00a0", " ").split():
+            try:
+                n = int(token)
+                if n > 0:
+                    nums.append(n)
+            except ValueError:
+                continue
+        if not nums:
+            return None, None, None
+        return nums[-1], nums[-2] if len(nums) > 1 else None, None
 
     async def add_counter_value(self, value: int) -> tuple[bool, str | None]:
         if not self.session:
             return False, "No session"
-        # POST to AddCounterValue with value and __RequestVerificationToken
-        return True, None  # placeholder
+        resp = await self.session.post(
+            f"{self.cfg.base_url}/AddCounterValue",
+            data={"value": str(value), "__RequestVerificationToken": self.csrf_token or ""},
+        )
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}"
+        return True, None
 
     async def get_debt(self) -> tuple[str | None, str | None]:
         if not self.session:
             return None, None
-        # Parse debt from LK
-        return None, None  # placeholder
+        resp = await self.session.get(f"{self.cfg.base_url}/Personal/Debt")
+        if resp.status_code >= 400:
+            return None, None
+        debt_text = resp.text.strip()
+        if not debt_text:
+            return None, None
+        return debt_text, None
+
+
+def get_vodokanal_client(
+    *, dry_run: bool, login: str, password: str, base_url: str = "https://abonent.vodokanal.net"
+) -> VodokanalClient:
+    """Factory: pick real or stub client based on DRY_RUN mode."""
+    if dry_run:
+        return StubVodokanalClient(dry_run=True)
+    cfg = ClientConfig(login=login, password=password, base_url=base_url)
+    client = HttpxVodokanalClient(cfg)
+    # Ensure a session exists even before async context manager usage.
+    client.session = httpx.AsyncClient(timeout=cfg.timeout, follow_redirects=cfg.follow_redirects)
+    return client
