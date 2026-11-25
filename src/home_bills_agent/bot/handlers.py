@@ -138,10 +138,11 @@ async def _download_photo(message: Message) -> bytes | None:
         return None
 
 
-def _payment_keyboard() -> InlineKeyboardMarkup:
+def _payment_keyboard(payment_link: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплачено", callback_data="mark_paid")]
+            [InlineKeyboardButton(text="💳 Оплатить", url=payment_link)],
+            [InlineKeyboardButton(text="✅ Оплачено", callback_data="mark_paid")],
         ]
     )
 
@@ -165,7 +166,8 @@ def _payment_text(cycle) -> str:
 
 
 async def _send_payment_prompt(message: Message, cycle) -> None:
-    await message.answer(_payment_text(cycle), reply_markup=_payment_keyboard())
+    link = cycle.payment_link or build_payment_link(settings.ACCOUNT_ID)
+    await message.answer(_payment_text(cycle), reply_markup=_payment_keyboard(link))
 
 
 def _advance_to_awaiting_payment(fsm: CycleFSM):
@@ -419,7 +421,10 @@ async def cb_confirm_anomaly(callback: CallbackQuery) -> None:
         await callback.message.edit_text(f"✅ Показание {value} подтверждено и передано.")
         awaiting = _advance_to_awaiting_payment(fsm)
         if awaiting:
-            await callback.message.answer(_payment_text(awaiting), reply_markup=_payment_keyboard())
+            link = awaiting.payment_link or build_payment_link(settings.ACCOUNT_ID)
+            await callback.message.answer(
+                _payment_text(awaiting), reply_markup=_payment_keyboard(link)
+            )
         else:
             await callback.answer("❌ Не удалось отправить ссылку на оплату.")
     else:
