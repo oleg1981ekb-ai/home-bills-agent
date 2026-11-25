@@ -11,3 +11,8 @@ __pycache__/
 .kilo/memory.json
 qdrant_storage/
 .playwright-mcp/
+
+# Local editor / runtime / build artifacts
+.vscode/
+src/data/
+*.egg-info/
