@@ -42,6 +42,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     CycleStatus.ACCRUAL_PENDING: {
         CycleStatus.AWAITING_PAYMENT,
         CycleStatus.MANUAL_REVIEW,
+        CycleStatus.CANCELLED,
     },
     CycleStatus.AWAITING_PAYMENT: {
         CycleStatus.PAID,
@@ -51,7 +52,7 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         CycleStatus.CANCELLED,
     },
     CycleStatus.CANCELLED: {CycleStatus.WAITING_READING},
-    CycleStatus.MANUAL_REVIEW: set(),
+    CycleStatus.MANUAL_REVIEW: {CycleStatus.CANCELLED},
 }
 
 

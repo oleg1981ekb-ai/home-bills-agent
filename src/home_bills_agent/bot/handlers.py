@@ -171,10 +171,7 @@ async def cmd_reset(message: Message) -> None:
         return
 
     # Cancel current cycle if it's not already terminal
-    if active.status not in (
-        CycleStatus.CANCELLED,
-        CycleStatus.MANUAL_REVIEW,
-    ):
+    if active.status != CycleStatus.CANCELLED:
         fsm.transition(
             settings.ACCOUNT_ID,
             period,
@@ -211,8 +208,19 @@ async def cmd_status(message: Message) -> None:
         CycleStatus.PAID: "✅",
         CycleStatus.MANUAL_REVIEW: "🔧",
         CycleStatus.CANCELLED: "❌",
+        CycleStatus.ACCRUAL_PENDING: "🔍",
     }.get(cycle.status, "❓")
-    text = f"{status_emoji} Статус: {cycle.status}"
+    status_label = {
+        CycleStatus.WAITING_READING: "Ожидание показания",
+        CycleStatus.READING_SENT: "Показание передано",
+        CycleStatus.AWAITING_ANOMALY_CONFIRMATION: "Аномалия подтверждена",
+        CycleStatus.AWAITING_PAYMENT: "Ожидание оплаты",
+        CycleStatus.PAID: "Оплачено",
+        CycleStatus.MANUAL_REVIEW: "Ручной разбор",
+        CycleStatus.CANCELLED: "Отменено",
+        CycleStatus.ACCRUAL_PENDING: "Ожидание начисления",
+    }.get(cycle.status, cycle.status)
+    text = f"{status_emoji} Статус: {status_label} ({cycle.status})"
     hint = _reset_hint(cycle)
     if hint:
         text += f"\n\n{hint}"
