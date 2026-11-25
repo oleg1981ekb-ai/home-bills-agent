@@ -1,14 +1,14 @@
-# Project AI Contract: {{ project_name }}
+# Project AI Contract: Home Bills Agent (Anapa Water Agent v1.1)
 
 ## 1. Project Overview & Source of Truth
-- **Description:** {{ project_description }}
+- **Description:** Telegram-бот для приёма показаний водяных счётчиков АО «Анапа Водоканал», напоминаний, проверки аномалий, автоматической отправки в личный кабинет и интеграции оплаты через сервис А3.
 - **Requirements & Architecture SoT:** For requirements and architecture, the source of truth is `SPEC/spec.yaml`, `SPEC/SPEC.md`, and `docs/ARCHITECTURE.md`. Read them before proposing architectural changes.
 - **AI-Infra SoT:** SPEC is NOT the source of truth for AI infrastructure. Models, permissions, MCP servers, and security policies are governed by `AGENTS.md`, `kilo.jsonc`, `.kilo/`, and `.github/`.
 - **Governance Standard:** This repository follows AI Infrastructure Governance Standard v1.2.
 
 ## 2. Approved LLM Models (Manual Switch Only)
-- **Primary Model ID:** `{{ primary_model }}`
-- **Fallback Model ID:** `{{ fallback_model }}`
+- **Primary Model ID:** `anthropic/claude-sonnet-4-5`
+- **Fallback Model ID:** `openai/gpt-4.1`
 - **Last Verification Date:** `2026-11-15`
 - **Policy:** Floating aliases (`latest`, `auto`) and unapproved consumer endpoints are strictly forbidden. See `.kilo/approved_models.yaml`.
 
