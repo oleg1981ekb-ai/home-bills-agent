@@ -12,20 +12,20 @@ from typing import Any
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import select
 
-from home_bills_agent.assistant.vision import VisionResult, recognize_reading
+from home_bills_agent.assistant.vision import VisionResult, is_confident, recognize_reading
 from home_bills_agent.config import settings
 from home_bills_agent.payment.links import build_payment_link
 from home_bills_agent.providers.anapa_vodokanal.client import StubVodokanalClient
 from home_bills_agent.storage import CycleFSM, CycleStatus, init_db
-from home_bills_agent.storage.anomaly import median_of_whole_readings
+from home_bills_agent.storage.anomaly import can_detect_anomaly, median_of_whole_readings
+from home_bills_agent.storage.models import ReadingsCache
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 SESSION_FACTORY = init_db()
-
-_recent_readings: list[dict[str, Any]] = []
 
 
 def _get_fsm() -> CycleFSM:
@@ -34,6 +34,61 @@ def _get_fsm() -> CycleFSM:
 
 def _current_period() -> str:
     return datetime.now().strftime("%Y-%m")
+
+
+async def _get_last_reading() -> int:
+    """Get last whole reading from LK client (dry-run/stub aware) or fallback."""
+    client = StubVodokanalClient(dry_run=settings.DRY_RUN)
+    whole, _prev, _debt = await client.get_counter_readings()
+    if whole is not None:
+        return int(whole)
+    fsm = _get_fsm()
+    cycle = fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period())
+    if cycle is not None and cycle.previous_reading is not None:
+        return int(cycle.previous_reading)
+    return 0
+
+
+def _load_recent_readings(account_id: str, period: str, limit: int = 12) -> list[dict[str, Any]]:
+    """Load recent whole readings from cache for anomaly detection."""
+    with SESSION_FACTORY() as session:
+        rows = (
+            session.execute(
+                select(ReadingsCache)
+                .where(ReadingsCache.account_id == account_id)
+                .where(ReadingsCache.period == period)
+                .where(ReadingsCache.is_integer == 1)
+                .order_by(ReadingsCache.reading_date.desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        return [
+            {
+                "reading_value": r.reading_value,
+                "reading_date": r.reading_date,
+                "is_integer": r.is_integer,
+            }
+            for r in rows
+        ]
+
+
+def _cache_reading(account_id: str, period: str, value: int, source: str) -> None:
+    """Save accepted reading to cache (dry-run aware)."""
+    with SESSION_FACTORY() as session:
+        cache = ReadingsCache(
+            account_id=account_id,
+            period=period,
+            reading_date=datetime.now(),
+            reading_value=Decimal(value),
+            source=source,
+            is_integer=1,
+        )
+        session.add(cache)
+        if not settings.DRY_RUN:
+            session.commit()
+        session.rollback()
 
 
 def _validate_reading(value: str) -> tuple[int | None, str | None]:
@@ -197,15 +252,9 @@ async def _handle_reading(message: Message, value: int) -> None:
         )
         return
 
-# Get last reading from FSM
-    last_reading = 0
+    # Get last reading from LK/client or fallback
+    last_reading = await _get_last_reading()
     fsm = _get_fsm()
-    try:
-        prev_cycle = fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period())
-        if prev_cycle and prev_cycle.previous_reading:
-            last_reading = int(prev_cycle.previous_reading)
-    except (AttributeError, ValueError):
-        pass
 
     if value < last_reading:
         await message.answer(f"❌ Показание меньше предыдущего ({last_reading}).")
@@ -219,8 +268,11 @@ async def _handle_reading(message: Message, value: int) -> None:
             event_type="cycle.start",
         )
 
-    # Anomaly check
-    is_anomaly = _check_anomaly(value, last_reading, _recent_readings)
+    # Anomaly check: only when enough history (can_detect_anomaly) — else smooth happy path
+    recent_readings = _load_recent_readings(settings.ACCOUNT_ID, _current_period())
+    is_anomaly = can_detect_anomaly(recent_readings, settings.ANOMALY_FACTOR) and _check_anomaly(
+        value, last_reading, recent_readings
+    )
 
     if is_anomaly:
         c = fsm.transition(
@@ -272,6 +324,8 @@ async def _handle_reading(message: Message, value: int) -> None:
             event_description=err_msg,
         )
         return
+
+    _cache_reading(settings.ACCOUNT_ID, _current_period(), value, "text")
 
     # Transition to READING_SENT
     c = fsm.transition(
@@ -332,10 +386,44 @@ async def _handle_photo(message: Message) -> None:
         return
 
     value = result.value
+    last_reading = await _get_last_reading()
+    fsm = _get_fsm()
 
+    if value < last_reading:
+        await message.answer(f"❌ Показание меньше предыдущего ({last_reading}).")
+        return
+
+    # Авто-принятие при высокой уверенности
+    if is_confident(result):
+        _cache_reading(settings.ACCOUNT_ID, _current_period(), value, "photo")
+        c = fsm.transition(
+            settings.ACCOUNT_ID,
+            _current_period(),
+            CycleStatus.READING_SENT,
+            reading_value=Decimal(value),
+            previous_reading=Decimal(last_reading),
+            reading_source="photo",
+            event_type="photo.recognized.confirmed",
+            event_description=f"Фото распознано: {value}, уверенность {result.confidence:.2f}, принято автоматически.",
+        )
+        if c:
+            consumption = c.consumption
+            consumption_str = f"{int(consumption)} м³" if consumption is not None else "—"
+            await message.answer(
+                f"✅ Показание {value} распознано и принято. Расход: {consumption_str}."
+            )
+            awaiting = _advance_to_awaiting_payment(fsm)
+            if awaiting:
+                await _send_payment_prompt(message, awaiting)
+            else:
+                await message.answer("✅ Показание передано. Ожидаем начисления.")
+        else:
+            await message.answer("❌ Не удалось обновить статус.")
+        return
+
+    # Обычный путь: ожидание подтверждения аномалии
     last_reading = 0
     try:
-        fsm = _get_fsm()
         prev_cycle = fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period())
         if prev_cycle and prev_cycle.previous_reading:
             last_reading = int(prev_cycle.previous_reading)
@@ -346,7 +434,8 @@ async def _handle_photo(message: Message) -> None:
         await message.answer(f"❌ Показание меньше предыдущего ({last_reading}).")
         return
 
-    fsm = _get_fsm()
+    _cache_reading(settings.ACCOUNT_ID, _current_period(), value, "photo")
+
     c = fsm.transition(
         settings.ACCOUNT_ID,
         _current_period(),
