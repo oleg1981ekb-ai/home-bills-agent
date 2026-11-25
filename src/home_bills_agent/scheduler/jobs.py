@@ -80,6 +80,18 @@ def check_due_reminders() -> list[str]:
         compute_debt_delta([cycle.__dict__] if hasattr(cycle, "__dict__") else [])
         actions.append(f"accrual_check:{cycle.account_id}:{period}")
 
+    elif cycle.status == CycleStatus.PAID:
+        # Payment verification: check if debt decreased after user marked PAID.
+        check_payment(
+            FSM,
+            cycle.account_id,
+            period,
+            debt_before=cycle.debt_before,
+            debt_now=cycle.debt_after,
+            now=datetime.now(),
+        )
+        actions.append(f"payment_check:{cycle.account_id}:{period}")
+
     return actions
 
 
