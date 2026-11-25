@@ -6,7 +6,7 @@ Uses FSM + SQLite as source of truth.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -146,9 +146,54 @@ async def cmd_help(message: Message) -> None:
         "📋 Доступные команды:\n"
         "/start — главное меню\n"
         "/status — текущий цикл\n"
-        "/help — помощь\n\n"
+        "/help — помощь\n"
+        "/reset — сбросить текущий цикл и начать заново\n\n"
         "Просто отправь целое число — это показание счётчика."
     )
+
+
+@router.message(F.text == "/reset")
+async def cmd_reset(message: Message) -> None:
+    """Reset current billing cycle to start fresh."""
+    fsm = _get_fsm()
+    period = _current_period()
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.WAITING_READING,
+            event_type="cycle.reset",
+            event_description="Цикл сброшен командой /reset.",
+        )
+        await message.answer("🔄 Цикл сброшен. Отправьте показание счётчика.")
+        return
+
+    # Cancel current cycle if it's not already terminal
+    if active.status not in (
+        CycleStatus.CANCELLED,
+        CycleStatus.MANUAL_REVIEW,
+    ):
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.CANCELLED,
+            event_type="cycle.reset",
+            event_description=f"Цикл сброшен из статуса {active.status}.",
+        )
+
+    c = fsm.transition(
+        settings.ACCOUNT_ID,
+        period,
+        CycleStatus.WAITING_READING,
+        event_type="cycle.reset",
+        event_description="Новый цикл после сброса.",
+    )
+    if c:
+        await message.answer("🔄 Цикл сброшен. Отправьте показание счётчика.")
+    else:
+        await message.answer("❌ Не удалось сбросить цикл.")
 
 
 @router.message(F.text == "/status")
@@ -167,7 +212,69 @@ async def cmd_status(message: Message) -> None:
         CycleStatus.MANUAL_REVIEW: "🔧",
         CycleStatus.CANCELLED: "❌",
     }.get(cycle.status, "❓")
-    await message.answer(f"{status_emoji} Статус: {cycle.status}")
+    text = f"{status_emoji} Статус: {cycle.status}"
+    hint = _reset_hint(cycle)
+    if hint:
+        text += f"\n\n{hint}"
+    await message.answer(text)
+
+
+# Порог «зависшего» цикла: 24 часа без изменений
+STALE_HOURS = 24
+
+
+def _reset_hint(cycle) -> str | None:
+    """Диагностика: вернуть подсказку о необходимости /reset, если цикл застрял."""
+    # Терминальные статусы, из которых нельзя продолжить без сброса
+    if cycle.status == CycleStatus.CANCELLED:
+        return "⚠️ Цикл отменён — новые показания не принимаются.\nОтправьте /reset для начала заново."
+    if cycle.status == CycleStatus.MANUAL_REVIEW:
+        return "⚠️ Цикл требует ручного разбора.\nОтправьте /reset для начала заново."
+
+    now = datetime.now(UTC)
+
+    def _to_aware(dt: datetime | None) -> datetime | None:
+        """Привести naive datetime из БД (utcnow) к aware UTC для сравнения."""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt
+
+    # Просроченная повторная проверка начисления
+    next_check = _to_aware(cycle.next_check_at)
+    if cycle.status == CycleStatus.ACCRUAL_PENDING and next_check is not None and now > next_check:
+        overdue = now - next_check
+        hours = int(overdue.total_seconds() // 3600)
+        return (
+            f"⚠️ Проверка начисления просрочена на {hours} ч.\n"
+            "Если начисление так и не появилось — отправьте /reset."
+        )
+
+    # Зависание в промежуточном статусе дольше STALE_HOURS
+    updated = _to_aware(cycle.updated_at or cycle.created_at)
+    if (
+        updated is not None
+        and cycle.status
+        not in (
+            CycleStatus.WAITING_READING,
+            CycleStatus.PAID,
+        )
+        and (now - updated).total_seconds() > STALE_HOURS * 3600
+    ):
+        hours = int((now - updated).total_seconds() // 3600)
+        return (
+            f"⚠️ Цикл без изменений уже {hours} ч в статусе {cycle.status}.\n"
+            "Если это зависание — отправьте /reset."
+        )
+
+    # Много неудачных повторов
+    if (cycle.retry_count or 0) >= 3:
+        return (
+            f"⚠️ Неудачных повторов: {cycle.retry_count}.\n"
+            "Рекомендуется /reset или ручная проверка."
+        )
+    return None
 
 
 def _check_anomaly(
@@ -178,8 +285,8 @@ def _check_anomaly(
     if med is not None and med > 0:
         # Simple heuristic: if value >> median * factor, flag as anomaly
         # In full implementation, compare daily consumption
-        delta = value - prev_reading
-        if delta > med * settings.ANOMALY_FACTOR:
+        delta = Decimal(value) - Decimal(prev_reading or 0)
+        if delta > med * Decimal(str(settings.ANOMALY_FACTOR)):
             return True
     elif med is None:
         # Not enough data — always confirm
@@ -212,6 +319,14 @@ def _cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отменить оплату", callback_data="cancel_payment")]
+        ]
+    )
+
+
+def _reset_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Сбросить цикл", callback_data="reset_cycle")]
         ]
     )
 
@@ -266,7 +381,8 @@ async def _handle_reading(message: Message, value: int) -> None:
         await message.answer(f"❌ Показание меньше предыдущего ({last_reading}).")
         return
 
-    if fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period()) is None:
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, _current_period())
+    if active is None or active.status == CycleStatus.CANCELLED:
         fsm.transition(
             settings.ACCOUNT_ID,
             _current_period(),
@@ -303,7 +419,11 @@ async def _handle_reading(message: Message, value: int) -> None:
                         InlineKeyboardButton(
                             text="✅ Подтвердить",
                             callback_data=f"confirm:{value}",
-                        )
+                        ),
+                        InlineKeyboardButton(
+                            text="🔄 Сбросить цикл",
+                            callback_data="reset_cycle",
+                        ),
                     ]
                 ]
             )
@@ -487,7 +607,11 @@ async def _handle_photo(message: Message) -> None:
                 InlineKeyboardButton(
                     text="✅ Подтвердить",
                     callback_data=f"confirm:{value}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Сбросить цикл",
+                    callback_data="reset_cycle",
+                ),
             ]
         ]
     )
@@ -589,6 +713,49 @@ async def cb_cancel_payment(callback: CallbackQuery) -> None:
         )
     else:
         await callback.answer("❌ Не удалось отменить.")
+
+
+@router.callback_query(F.data == "reset_cycle")
+async def cb_reset_cycle(callback: CallbackQuery) -> None:
+    """User resets the current billing cycle to start fresh."""
+    fsm = _get_fsm()
+    period = _current_period()
+    active = fsm.get_active_cycle(settings.ACCOUNT_ID, period)
+
+    if active is None:
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.WAITING_READING,
+            event_type="cycle.reset",
+            event_description="Цикл сброшен кнопкой.",
+        )
+        await callback.message.edit_text("🔄 Цикл сброшен. Отправьте показание счётчика.")
+        return
+
+    if active.status not in (
+        CycleStatus.CANCELLED,
+        CycleStatus.MANUAL_REVIEW,
+    ):
+        fsm.transition(
+            settings.ACCOUNT_ID,
+            period,
+            CycleStatus.CANCELLED,
+            event_type="cycle.reset",
+            event_description=f"Цикл сброшен из статуса {active.status}.",
+        )
+
+    c = fsm.transition(
+        settings.ACCOUNT_ID,
+        period,
+        CycleStatus.WAITING_READING,
+        event_type="cycle.reset",
+        event_description="Новый цикл после сброса.",
+    )
+    if c:
+        await callback.message.edit_text("🔄 Цикл сброшен. Отправьте показание счётчика.")
+    else:
+        await callback.answer("❌ Не удалось сбросить цикл.")
 
 
 @router.message(F.photo)

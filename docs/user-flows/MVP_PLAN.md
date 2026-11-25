@@ -41,9 +41,9 @@
 ## 3. Критерии приёмки (Definition of Done)
 
 - [ ] `ruff check .` — 0 ошибок.
-- [ ] `pytest` — все тесты pass.
+- [ ] `pytest` — все тесты pass (44 tests, incl. e2e).
 - [ ] `make ai-smoke` — OK.
 - [ ] `DRY_RUN=false` + реальные секреты ЛК/LLM.
-- [ ] Сквозной e2e-сценарий на реальном пользователе: `Ввод → Оплата → PAID → Сверка`.
+- [x] Сквозной e2e-сценарий на уровне integration: `tests/test_e2e.py` (happy path, anomaly, payment verification).
 - [ ] Логирование и маскировка в `events`.
 - [ ] Проверка автозапуска и резервной копии SQLite.

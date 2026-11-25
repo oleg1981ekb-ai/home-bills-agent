@@ -17,6 +17,7 @@ Telegram-бот для приёма показаний водяных счётч
 
 - Lint: `ruff check .`
 - Tests: `python3.15 -m pytest tests/ -q`
+- E2E (full billing cycle): `python3.15 -m pytest tests/test_e2e.py -v`
 - AI infra smoke: `make ai-smoke`
 
 ## Развёртывание
