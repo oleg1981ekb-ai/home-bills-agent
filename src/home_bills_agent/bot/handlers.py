@@ -146,6 +146,14 @@ def _payment_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить оплату", callback_data="cancel_payment")]
+        ]
+    )
+
+
 def _payment_text(cycle) -> str:
     link = cycle.payment_link or build_payment_link(settings.ACCOUNT_ID)
     lines = ["💳 Оплата"]
@@ -430,9 +438,32 @@ async def cb_mark_paid(callback: CallbackQuery) -> None:
         event_description="Пользователь отметил оплату.",
     )
     if c:
-        await callback.message.edit_text("✅ Оплата отмечена. Будем проверять.")
+        await callback.message.edit_text(
+            "✅ Оплата отмечена. Будем проверять.",
+            reply_markup=_cancel_keyboard(),
+        )
     else:
         await callback.answer("❌ Не удалось отметить.")
+
+
+@router.callback_query(F.data == "cancel_payment")
+async def cb_cancel_payment(callback: CallbackQuery) -> None:
+    """User cancels the marked payment."""
+    fsm = _get_fsm()
+    c = fsm.transition(
+        settings.ACCOUNT_ID,
+        _current_period(),
+        CycleStatus.CANCELLED,
+        event_type="payment.cancelled",
+        event_description="Пользователь отменил оплату.",
+    )
+    if c:
+        await callback.message.edit_text(
+            "❌ Оплата отменена. Цикл остановлен.",
+            reply_markup=None,
+        )
+    else:
+        await callback.answer("❌ Не удалось отменить.")
 
 
 @router.message(F.photo)
